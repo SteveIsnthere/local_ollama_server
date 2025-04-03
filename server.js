@@ -1,8 +1,8 @@
 'use strict';
 
-const express = require('express');
-const ollama = require('ollama');
-const EventEmitter = require('events');
+import express from 'express';
+import ollama from 'ollama';
+import { EventEmitter } from 'events';
 
 // OllamaServer class definition
 class OllamaServer extends EventEmitter {
@@ -197,7 +197,9 @@ app.post('/complete', async (req, res) => {
 // GET /models endpoint: returns a list of available models
 app.get('/models', async (req, res) => {
     try {
+        console.log('Fetching models...');
         const models = await listOllamaModels();
+        console.log(models)
         res.json({models});
     } catch (error) {
         res.status(500).json({error: error.message});
@@ -207,4 +209,9 @@ app.get('/models', async (req, res) => {
 // Start the Express server
 app.listen(port, () => {
     console.log(`Express server is running on port ${port}`);
+});
+
+
+app.get('/', (req, res) => {
+  res.send('Hello world');
 });
