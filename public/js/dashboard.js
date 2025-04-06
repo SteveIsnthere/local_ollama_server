@@ -161,13 +161,6 @@ document.addEventListener('DOMContentLoaded', function() {
         document.getElementById('reservedVram').textContent = formatSize(vram.tracked.reserved);
     }
 
-    // Update server info
-    function updateServerInfo(ollamaServer) {
-        document.getElementById('defaultModel').textContent = ollamaServer.config?.defaultModel || '-';
-        document.getElementById('keepAlive').textContent = ollamaServer.config?.keepAliveDuration || '-';
-        document.getElementById('lastUpdated').textContent = new Date().toLocaleString();
-    }
-
     // Fetch dashboard data
     async function fetchDashboardData() {
         try {
@@ -185,14 +178,6 @@ document.addEventListener('DOMContentLoaded', function() {
 
             // Update queue
             updateQueueItems(data.queue);
-
-            // Update server info
-            updateServerInfo({
-                config: {
-                    defaultModel: document.getElementById('defaultModel').textContent,
-                    keepAliveDuration: document.getElementById('keepAlive').textContent
-                }
-            });
         } catch (error) {
             console.error('Error fetching dashboard data:', error);
         }
