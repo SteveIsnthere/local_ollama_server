@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ollama Server Dashboard</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>Ollama Server Dashboard</h1>
+        <div class="game-mode-toggle">
+            <button id="gameMode" class="btn">Enable Game Mode</button>
+            <div class="status">
+                <span>Status:</span>
+                <span id="gameModeStatus" class="inactive">Inactive</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="dashboard">
+        <div class="card vram-usage">
+            <h2>VRAM Usage</h2>
+            <div class="chart-container">
+                <canvas id="vramChart"></canvas>
+            </div>
+            <div class="stats">
+                <div class="stat">
+                    <span>Total:</span>
+                    <span id="totalVram">- GB</span>
+                </div>
+                <div class="stat">
+                    <span>Used:</span>
+                    <span id="usedVram">- GB</span>
+                </div>
+                <div class="stat">
+                    <span>Free:</span>
+                    <span id="freeVram">- GB</span>
+                </div>
+                <div class="stat">
+                    <span>Reserved:</span>
+                    <span id="reservedVram">- GB</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="card loaded-models">
+            <h2>Loaded Models</h2>
+            <div class="models-list" id="modelsList">
+                <div class="no-models">No models currently loaded</div>
+            </div>
+        </div>
+
+        <div class="card queue-status">
+            <h2>Queue Status</h2>
+            <div class="stats">
+                <div class="stat">
+                    <span>Tasks in queue:</span>
+                    <span id="queueCount">0</span>
+                </div>
+            </div>
+            <div id="queueItems" class="queue-items">
+                <div class="no-queue">Queue is empty</div>
+            </div>
+        </div>
+
+        <div class="card server-info">
+            <h2>Server Information</h2>
+            <div class="stats">
+                <div class="stat">
+                    <span>Default Model:</span>
+                    <span id="defaultModel">-</span>
+                </div>
+                <div class="stat">
+                    <span>Keep Alive:</span>
+                    <span id="keepAlive">-</span>
+                </div>
+                <div class="stat">
+                    <span>Last Updated:</span>
+                    <span id="lastUpdated">-</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/js/dashboard.js"></script>
+</body>
+</html>
