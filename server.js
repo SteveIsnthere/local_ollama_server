@@ -3,20 +3,71 @@
 import express from 'express';
 import ollama from 'ollama';
 import EventEmitter from 'events';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 // ----- VRAM Configuration -----
-// Total available VRAM (in GB) and reserved VRAM for system overhead.
 const VRAM_GB = 16;
-const RESERVED_VRAM = 3.5; // GB reserved for system/other tasks
+const RESERVED_VRAM = 3.5;
 const AVAILABLE_VRAM = VRAM_GB - RESERVED_VRAM;
+const MODEL_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes in milliseconds
 
 /**
- * Retrieves the size of a given model (in GB) by calling ollama.list().
- * Caches results to avoid repeated API calls.
- * If the model is not found, defaults to 1GB.
- *
- * @param {string} modelName - The name of the model.
- * @returns {Promise<number>} - The model size in GB.
+ * Get real NVIDIA GPU VRAM usage using nvidia-smi
+ * @returns {Promise<{total: number, used: number, free: number}>} VRAM in GB
+ */
+async function getNvidiaVRAMUsage() {
+    try {
+        // Query total VRAM
+        const { stdout: totalOutput } = await execAsync('nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits');
+        const totalVRAM = parseInt(totalOutput.trim()) / 1024; // Convert MB to GB
+
+        // Query used VRAM
+        const { stdout: usedOutput } = await execAsync('nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits');
+        const usedVRAM = parseInt(usedOutput.trim()) / 1024; // Convert MB to GB
+
+        return {
+            total: totalVRAM,
+            used: usedVRAM,
+            free: totalVRAM - usedVRAM
+        };
+    } catch (error) {
+        console.warn("Could not get NVIDIA GPU metrics:", error.message);
+        // Return default values if nvidia-smi fails
+        return { total: VRAM_GB, used: RESERVED_VRAM, free: AVAILABLE_VRAM };
+    }
+}
+
+/**
+ * Get currently loaded models via ollama.ps()
+ * @returns {Promise<Array<{name: string, size: number}>>} Loaded models
+ */
+async function getLoadedModels() {
+    try {
+        const response = await ollama.ps();
+
+        // FIX: Use models property instead of processes
+        if (!response.models) {
+            console.log("Unexpected ollama.ps() response format:", response);
+            return [];
+        }
+
+        return response.models.map(model => ({
+            name: model.name,
+            running: true, // Assume all models returned by ps() are running
+            size: model.size_vram ? model.size_vram / (1024 * 1024 * 1024) : undefined, // Convert to GB
+            expires: model.expires_at ? new Date(model.expires_at) : undefined
+        }));
+    } catch (error) {
+        console.error("Failed to get loaded models:", error);
+        return [];
+    }
+}
+
+/**
+ * Model size caching and retrieval
  */
 const modelSizeCache = new Map();
 async function getModelSize(modelName) {
@@ -28,51 +79,130 @@ async function getModelSize(modelName) {
     try {
         console.log(`Fetching size for model: ${modelName}`);
         const list = await ollama.list();
-        // Find a matching model by checking both `name` and `model` fields.
         const modelInfo = list.models.find(
             (m) => m.name === modelName || m.model === modelName
         );
 
-        let sizeGb = 1; // Default size if not found or size info missing
+        let sizeGb = 1; // Default size
         if (modelInfo?.size) {
             sizeGb = modelInfo.size / (1024 * 1024 * 1024);
         } else {
-            console.warn(`Model ${modelName} not found or size missing in ollama list. Defaulting to 1GB.`);
+            console.warn(`Model ${modelName} not found or size missing. Defaulting to 1GB.`);
         }
 
         modelSizeCache.set(modelName, sizeGb);
         console.log(`Model ${modelName} size: ${sizeGb.toFixed(2)} GB`);
         return sizeGb;
     } catch (error) {
-        console.error(`Error fetching model list to get size for ${modelName}:`, error);
-        // Cache the default size on error to prevent repeated failed lookups
+        console.error(`Error fetching model size for ${modelName}:`, error);
         modelSizeCache.set(modelName, 1);
-        return 1; // Default to 1GB on error
+        return 1;
     }
 }
 
-// ----- OllamaServer Class -----
+/**
+ * Enhanced OllamaServer class with improved VRAM monitoring
+ */
 class OllamaServer extends EventEmitter {
     static instance;
     config;
-    // For tracking *active* tasks’ VRAM usage (in GB) - models being actively used for generation
+
+    // VRAM tracking
     currentActiveVRAMUsage = 0;
-    // FIFO queue for tasks waiting for available VRAM
     taskQueue = [];
-    DEFAULT_MODEL = 'phi3:mini'; // Consider updating the default model
+    DEFAULT_MODEL = 'gemma3:1b';
+
+    // Enhanced model tracking (for our own management)
+    loadedModels = new Map(); // modelName -> {size, lastUsed, activeTaskCount}
+
+    // VRAM monitoring
+    vramMonitorInterval = null;
+    actualVRAMUsage = { total: VRAM_GB, used: 0, free: AVAILABLE_VRAM };
 
     constructor(options = {}) {
         super();
         this.config = {
             defaultModel: options.defaultModel || this.DEFAULT_MODEL,
-            connectionTimeoutMs: options.connectionTimeoutMs || 1200000, // 20 minutes
-            generationTimeoutMs: options.generationTimeoutMs || 0, // No specific timeout for generation itself
+            connectionTimeoutMs: options.connectionTimeoutMs || 1200000,
+            generationTimeoutMs: options.generationTimeoutMs || 0,
             maxRetries: options.maxRetries || 3,
             retryDelayMs: options.retryDelayMs || 1000,
-            // --- NEW: Use Ollama's keep_alive string format ---
-            keepAliveDuration: options.keepAliveDuration || '10m', // Keep models loaded for 10 minutes after use
+            keepAliveDuration: options.keepAliveDuration || '10m', // Ollama format
+            vramMonitorIntervalMs: options.vramMonitorIntervalMs || 10000, // Check VRAM every 10 seconds
         };
+
+        // Start VRAM monitoring
+        this.startVRAMMonitoring();
+
         console.log('OllamaServer configured with:', this.config);
+    }
+
+    /**
+     * Start monitoring NVIDIA VRAM usage and loaded models
+     */
+    startVRAMMonitoring() {
+        if (this.vramMonitorInterval) {
+            clearInterval(this.vramMonitorInterval);
+        }
+
+        this.vramMonitorInterval = setInterval(async () => {
+            try {
+                // Get real VRAM usage
+                this.actualVRAMUsage = await getNvidiaVRAMUsage();
+
+                // Get loaded models from Ollama
+                const loadedModels = await getLoadedModels();
+
+                // Update our model tracking
+                this.syncLoadedModels(loadedModels);
+
+                this.emit('vram:updated', {
+                    vram: this.actualVRAMUsage,
+                    loadedModels: loadedModels.length
+                });
+            } catch (error) {
+                console.error("VRAM monitoring error:", error);
+            }
+        }, this.config.vramMonitorIntervalMs);
+
+        // Don't keep Node.js running just for this interval
+        if (this.vramMonitorInterval.unref) {
+            this.vramMonitorInterval.unref();
+        }
+    }
+
+    /**
+     * Sync our model tracking with actual loaded models from Ollama
+     */
+    async syncLoadedModels(loadedModels) {
+        // Create map of currently loaded models from Ollama
+        const ollamaModels = new Map();
+        for (const model of loadedModels) {
+            ollamaModels.set(model.name, model);
+        }
+
+        // Update our tracking of loaded models
+        for (const [modelName, modelInfo] of this.loadedModels.entries()) {
+            if (!ollamaModels.has(modelName) && modelInfo.activeTaskCount === 0) {
+                // Model is no longer loaded in Ollama and has no active tasks
+                this.loadedModels.delete(modelName);
+                this.emit('model:unloaded', { modelName });
+            }
+        }
+
+        // Add any models Ollama has loaded that we're not tracking
+        for (const [modelName, modelInfo] of ollamaModels.entries()) {
+            if (!this.loadedModels.has(modelName)) {
+                const modelSize = modelInfo.size || await getModelSize(modelName);
+                this.loadedModels.set(modelName, {
+                    size: modelSize,
+                    lastUsed: Date.now(),
+                    activeTaskCount: 0,
+                    expires: modelInfo.expires
+                });
+                this.emit('model:loaded', { modelName, modelSize });
+            }
+        }
     }
 
     static getInstance(options) {
@@ -85,119 +215,165 @@ class OllamaServer extends EventEmitter {
     }
 
     updateConfig(options) {
-        // Update keepAliveDuration specifically if provided
-        if (options.keepAliveDuration) {
-            this.config.keepAliveDuration = options.keepAliveDuration;
-        }
-        // Update other config options
         Object.assign(this.config, options);
+
+        // Update VRAM monitoring interval if needed
+        if (options.vramMonitorIntervalMs && this.vramMonitorInterval) {
+            this.startVRAMMonitoring();
+        }
+
         console.log('OllamaServer config updated:', this.config);
         return this;
     }
 
     /**
-     * Enqueues a task. Runs immediately if VRAM for *active* tasks allows.
-     * Relies on Ollama's internal mechanism + keep_alive for managing loaded models.
-     *
-     * @param {Function} task - The async task to run (should involve an ollama call).
-     * @param {string} modelName - The model associated with the task.
-     * @returns {Promise<any>}
+     * Track when model is used
+     */
+    trackModelUsage(modelName, modelSize) {
+        if (!modelName) return;
+
+        // Get current model info or create new entry
+        let modelInfo = this.loadedModels.get(modelName) || {
+            size: modelSize,
+            lastUsed: Date.now(),
+            activeTaskCount: 0
+        };
+
+        // Update usage time and increment active task count
+        modelInfo.lastUsed = Date.now();
+        modelInfo.activeTaskCount++;
+
+        // Store updated info
+        this.loadedModels.set(modelName, modelInfo);
+
+        this.emit('model:used', {
+            modelName,
+            modelSize,
+            activeTaskCount: modelInfo.activeTaskCount
+        });
+    }
+
+    /**
+     * Mark model task as completed
+     */
+    completeModelTask(modelName) {
+        if (!modelName || !this.loadedModels.has(modelName)) return;
+
+        const modelInfo = this.loadedModels.get(modelName);
+        modelInfo.activeTaskCount = Math.max(0, modelInfo.activeTaskCount - 1);
+        modelInfo.lastUsed = Date.now();
+
+        this.loadedModels.set(modelName, modelInfo);
+
+        this.emit('model:taskComplete', {
+            modelName,
+            activeTaskCount: modelInfo.activeTaskCount
+        });
+    }
+
+    /**
+     * Improved enqueue method with parallel execution optimization
      */
     async enqueue(task, modelName) {
-        const modelSize = await getModelSize(modelName || this.config.defaultModel);
+        const effectiveModelName = modelName || this.config.defaultModel;
+        const modelSize = await getModelSize(effectiveModelName);
 
         return new Promise((resolve, reject) => {
             const runTask = async () => {
-                // --- VRAM Check based on ACTIVE tasks ---
-                if (this.currentActiveVRAMUsage + modelSize > AVAILABLE_VRAM) {
-                    // This condition should theoretically not be hit if processQueue is working correctly,
-                    // but serves as a safeguard.
-                    console.warn(`[${modelName}] VRAM Check Failed unexpectedly inside runTask. Queueing again.`);
-                    this.taskQueue.push({ runTask, modelSize, modelName, resolve, reject });
-                    this.emit('task:queued', { modelName, modelSize, reason: 'VRAM insufficient at runtime' });
-                    this.processQueue(); // Try processing queue again
-                    return;
-                }
-
-                // --- Mark VRAM as actively used ---
+                // Update model tracking & VRAM usage
+                this.trackModelUsage(effectiveModelName, modelSize);
                 this.currentActiveVRAMUsage += modelSize;
+
                 this.emit('task:start', {
-                    modelName,
+                    modelName: effectiveModelName,
                     modelSize,
                     currentActiveVRAMUsage: this.currentActiveVRAMUsage,
-                    availableVRAM: AVAILABLE_VRAM,
+                    actualVRAMUsage: this.actualVRAMUsage
                 });
-                console.log(`[${modelName}] Task starting. Active VRAM: ${this.currentActiveVRAMUsage.toFixed(2)}/${AVAILABLE_VRAM.toFixed(2)} GB`);
+
+                console.log(`[${effectiveModelName}] Task starting. Our tracked VRAM: ${this.currentActiveVRAMUsage.toFixed(2)}/${AVAILABLE_VRAM.toFixed(2)} GB, Actual GPU VRAM: ${this.actualVRAMUsage.used.toFixed(2)}/${this.actualVRAMUsage.total.toFixed(2)} GB`);
 
                 try {
                     // Execute the actual Ollama operation
                     const result = await task();
                     resolve(result);
                 } catch (error) {
-                    console.error(`[${modelName}] Task failed:`, error);
+                    console.error(`[${effectiveModelName}] Task failed:`, error);
                     reject(error);
                 } finally {
-                    // --- Free up ACTIVE VRAM usage ---
-                    // The model might stay loaded due to keep_alive, but it's no longer actively processing this request.
+                    // Update tracking & free VRAM
+                    this.completeModelTask(effectiveModelName);
                     this.currentActiveVRAMUsage -= modelSize;
+
                     this.emit('task:complete', {
-                        modelName,
+                        modelName: effectiveModelName,
                         modelSize,
                         currentActiveVRAMUsage: this.currentActiveVRAMUsage,
                     });
-                    console.log(`[${modelName}] Task finished. Active VRAM: ${this.currentActiveVRAMUsage.toFixed(2)}/${AVAILABLE_VRAM.toFixed(2)} GB`);
 
-                    // --- Process the next task in the queue ---
+                    console.log(`[${effectiveModelName}] Task finished. Our tracked VRAM: ${this.currentActiveVRAMUsage.toFixed(2)}/${AVAILABLE_VRAM.toFixed(2)} GB`);
+
+                    // Process more tasks from queue
                     this.processQueue();
                 }
             };
 
-            // --- Initial Check: Can the task potentially run? ---
+            // Check if we have VRAM available
             if (this.currentActiveVRAMUsage + modelSize <= AVAILABLE_VRAM) {
-                // Enough VRAM for this task to become active; run immediately.
-                console.log(`[${modelName}] Sufficient VRAM (${(AVAILABLE_VRAM - this.currentActiveVRAMUsage).toFixed(2)} GB free). Running immediately.`);
+                console.log(`[${effectiveModelName}] Sufficient VRAM (${(AVAILABLE_VRAM - this.currentActiveVRAMUsage).toFixed(2)} GB free). Running immediately.`);
                 runTask();
-            } else {
-                // Not enough VRAM for another active task; queue it.
-                console.log(`[${modelName}] Insufficient VRAM (${(AVAILABLE_VRAM - this.currentActiveVRAMUsage).toFixed(2)} GB free, needs ${modelSize.toFixed(2)} GB). Queuing task.`);
-                this.taskQueue.push({ runTask, modelSize, modelName, resolve, reject });
-                this.emit('task:queued', { modelName, modelSize, reason: 'VRAM insufficient' });
+                return;
             }
+
+            // If we get here, we need to queue the task
+            console.log(`[${effectiveModelName}] Insufficient VRAM (${(AVAILABLE_VRAM - this.currentActiveVRAMUsage).toFixed(2)} GB free, needs ${modelSize.toFixed(2)} GB). Queuing task.`);
+            this.taskQueue.push({ runTask, modelSize, modelName: effectiveModelName });
+            this.emit('task:queued', {
+                modelName: effectiveModelName,
+                modelSize,
+                reason: 'VRAM insufficient'
+            });
         });
     }
 
     /**
-     * Checks the taskQueue and runs the *first* task that fits within the available *active* VRAM.
+     * Optimized queue processing to maximize parallel execution
      */
     processQueue() {
-        if (this.taskQueue.length === 0) {
-            return; // No tasks waiting
-        }
+        if (this.taskQueue.length === 0) return;
 
         console.log(`Processing queue. ${this.taskQueue.length} tasks waiting. Active VRAM: ${this.currentActiveVRAMUsage.toFixed(2)}/${AVAILABLE_VRAM.toFixed(2)} GB`);
 
-        for (let i = 0; i < this.taskQueue.length; i++) {
-            const { runTask, modelSize, modelName } = this.taskQueue[i];
+        // Sort tasks by size (smallest first) to maximize parallel execution
+        this.taskQueue.sort((a, b) => a.modelSize - b.modelSize);
 
-            if (this.currentActiveVRAMUsage + modelSize <= AVAILABLE_VRAM) {
-                console.log(`[${modelName}] Dequeuing task. Sufficient VRAM now available.`);
-                // Remove task from the queue
-                this.taskQueue.splice(i, 1);
-                // Run the task
-                runTask();
-                // Important: Only process *one* task per call to processQueue
-                // to ensure VRAM state is accurate for the next check.
-                break;
+        // Track how many tasks we started in this cycle
+        let tasksStarted = 0;
+
+        // Try to run as many tasks as possible in parallel
+        const availableVRAM = AVAILABLE_VRAM - this.currentActiveVRAMUsage;
+        const remainingTasks = [...this.taskQueue]; // Create a copy since we'll be modifying the original
+        this.taskQueue = []; // Clear the queue
+
+        // First-fit decreasing bin packing algorithm (optimized for parallel execution)
+        for (const task of remainingTasks) {
+            if (task.modelSize <= availableVRAM - this.currentActiveVRAMUsage) {
+                // There's enough VRAM for this task, run it immediately
+                this.currentActiveVRAMUsage += task.modelSize; // Reserve VRAM before running
+                task.runTask();
+                tasksStarted++;
             } else {
-                console.log(`[${modelName}] Task requires ${modelSize.toFixed(2)} GB, only ${(AVAILABLE_VRAM - this.currentActiveVRAMUsage).toFixed(2)} GB active VRAM available. Keeping queued.`);
+                // Not enough VRAM, put it back in the queue
+                this.taskQueue.push(task);
             }
         }
-        if (this.taskQueue.length > 0) {
-            console.log(`Queue processing finished. ${this.taskQueue.length} tasks still waiting.`);
-        }
+
+        console.log(`Queue processing finished. Started ${tasksStarted} tasks. ${this.taskQueue.length} tasks still waiting.`);
     }
 
-
+    /**
+     * Retry mechanism with timeout
+     */
     async retryWithTimeout(operation, modelName = 'unknown') {
         const { maxRetries, retryDelayMs, connectionTimeoutMs } = this.config;
         let lastError;
@@ -206,31 +382,33 @@ class OllamaServer extends EventEmitter {
             try {
                 this.emit('retry:attempt', { modelName, attempt, maxRetries });
                 console.log(`[${modelName}] Operation attempt ${attempt + 1}/${maxRetries}`);
+
                 const timeoutPromise = new Promise((_, reject) => {
-                    const timer = setTimeout(() => reject(new Error(`[${modelName}] Operation timed out after ${connectionTimeoutMs}ms`)), connectionTimeoutMs);
-                    // Ensure timeout doesn't keep Node.js running unnecessarily
-                    if (timer.unref) {
-                        timer.unref();
-                    }
+                    const timer = setTimeout(() =>
+                            reject(new Error(`[${modelName}] Operation timed out after ${connectionTimeoutMs}ms`)),
+                        connectionTimeoutMs
+                    );
+                    if (timer.unref) timer.unref();
                 });
-                // Promise.race will settle as soon as one promise settles (resolves or rejects)
+
                 return await Promise.race([operation(), timeoutPromise]);
             } catch (error) {
                 lastError = error;
                 this.emit('retry:failed', { modelName, attempt, error: lastError });
                 console.warn(`[${modelName}] Attempt ${attempt + 1} failed: ${error.message}`);
+
                 if (attempt < maxRetries - 1) {
                     console.log(`[${modelName}] Retrying in ${retryDelayMs}ms...`);
-                    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+                    await new Promise(resolve => setTimeout(resolve, retryDelayMs));
                 }
             }
         }
+
         console.error(`[${modelName}] Operation failed after ${maxRetries} attempts.`);
-        throw lastError; // Throw the last encountered error
+        throw lastError;
     }
 
     cleanThinkSection(content) {
-        // Added check for null/undefined content
         if (!content) return '';
         return content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');
     }
@@ -243,20 +421,23 @@ const ollamaServer = OllamaServer.getInstance();
 ollamaServer.on('task:start', (data) => console.log(`EVENT task:start - Model: ${data.modelName}, Size: ${data.modelSize.toFixed(2)}GB, Active VRAM: ${data.currentActiveVRAMUsage.toFixed(2)}GB`));
 ollamaServer.on('task:complete', (data) => console.log(`EVENT task:complete - Model: ${data.modelName}, Active VRAM: ${data.currentActiveVRAMUsage.toFixed(2)}GB`));
 ollamaServer.on('task:queued', (data) => console.log(`EVENT task:queued - Model: ${data.modelName}, Size: ${data.modelSize.toFixed(2)}GB, Reason: ${data.reason}`));
+ollamaServer.on('model:used', (data) => console.log(`EVENT model:used - Model: ${data.modelName}, Active Tasks: ${data.activeTaskCount}`));
+ollamaServer.on('model:loaded', (data) => console.log(`EVENT model:loaded - Model: ${data.modelName}, Size: ${data.modelSize.toFixed(2)}GB`));
+ollamaServer.on('model:unloaded', (data) => console.log(`EVENT model:unloaded - Model: ${data.modelName}`));
+ollamaServer.on('model:taskComplete', (data) => console.log(`EVENT model:taskComplete - Model: ${data.modelName}, Active Tasks: ${data.activeTaskCount}`));
+ollamaServer.on('vram:updated', (data) => console.log(`EVENT vram:updated - GPU VRAM Usage: ${data.vram.used.toFixed(2)}/${data.vram.total.toFixed(2)} GB, Loaded Models: ${data.loadedModels}`));
 ollamaServer.on('retry:attempt', (data) => console.log(`EVENT retry:attempt - Model: ${data.modelName}, Attempt: ${data.attempt + 1}/${data.maxRetries}`));
 ollamaServer.on('retry:failed', (data) => console.warn(`EVENT retry:failed - Model: ${data.modelName}, Attempt: ${data.attempt + 1}, Error: ${data.error.message}`));
 
-
 // ----- Functions to interact with Ollama -----
 
-// Non-streaming chat.
+// Non-streaming chat
 async function chatWithOllama(messages, options = {}) {
     const model = options.model || ollamaServer.config.defaultModel;
     const processedMessages = options.systemPrompt
         ? [{ role: 'system', content: options.systemPrompt }, ...messages]
         : messages;
 
-    // Enqueue the actual Ollama call
     return ollamaServer.enqueue(async () => {
         console.log(`Executing chat request for model: ${model}`);
         try {
@@ -264,126 +445,103 @@ async function chatWithOllama(messages, options = {}) {
                 return await ollama.chat({
                     model: model,
                     messages: processedMessages,
-                    // --- Use configured keepAliveDuration ---
                     keep_alive: ollamaServer.config.keepAliveDuration,
                     format: options.format,
-                    // Add any other relevant options from ollama-js if needed
                     options: {
-                        // Example: temperature, top_p, etc. Can be passed in `options.llmOptions`
                         ...(options.llmOptions || {})
                     }
                 });
-            }, model); // Pass modelName for logging in retry
+            }, model);
 
-            // Process response
             let content = response?.message?.content || '';
             if (options.format === 'json') {
                 try {
-                    // Attempt to parse only if format is explicitly JSON
                     return JSON.parse(content);
                 } catch (e) {
-                    console.warn(`[${model}] Failed to parse JSON response, returning raw content. Error: ${e.message}`);
-                    // Fallback to returning cleaned text if JSON parsing fails
+                    console.warn(`[${model}] Failed to parse JSON response. Error: ${e.message}`);
                     return ollamaServer.cleanThinkSection(content);
                 }
             }
-            // For non-JSON or failed JSON parsing, return cleaned text
             return ollamaServer.cleanThinkSection(content);
-
         } catch (error) {
             console.error(`Error during chatWithOllama for ${model}:`, error);
             const errorMessage = error instanceof Error
                 ? `${error.message}. Model: ${model}. Try 'ollama pull ${model}' or check Ollama server.`
                 : `Failed request for ${model}. Is Ollama running? Try 'ollama pull ${model}'.`;
-            throw new Error(errorMessage); // Re-throw standardized error
+            throw new Error(errorMessage);
         }
-    }, model); // Pass model name to enqueue for VRAM calculation
+    }, model);
 }
 
-// Non-streaming completion (uses chat endpoint).
+// Non-streaming completion
 async function completeWithOllama(prompt, options = {}) {
-    // Ensure options is an object
-    const effectiveOptions = { ...options };
-    return chatWithOllama([{ role: 'user', content: prompt }], effectiveOptions);
+    return chatWithOllama([{ role: 'user', content: prompt }], options);
 }
 
-// List available models. VRAM cost assumed negligible.
+// List available models
 async function listOllamaModels() {
-    // Use enqueue with null modelName (negligible VRAM) to respect concurrency limits if ever needed
     return ollamaServer.enqueue(async () => {
         console.log('Executing list models request');
         try {
             const response = await ollamaServer.retryWithTimeout(async () => {
                 return await ollama.list();
-            }, 'list-models'); // Identifier for logging
+            }, 'list-models');
             return response.models.map((model) => model.name);
         } catch (error) {
             console.error('Error listing Ollama models:', error);
             throw new Error('Failed to list models. Is Ollama running?');
         }
-    }, null); // null modelName -> 0 size assumed by getModelSize
+    }, null);
 }
 
-// Streaming chat with Ollama.
+// Streaming chat
 async function streamWithOllama(messages, options = {}, onToken) {
     const model = options.model || ollamaServer.config.defaultModel;
     const processedMessages = options.systemPrompt
         ? [{ role: 'system', content: options.systemPrompt }, ...messages]
         : messages;
 
-    // Enqueue the streaming operation
     return ollamaServer.enqueue(async () => {
         console.log(`Executing streaming chat request for model: ${model}`);
-        let stream;
         try {
-            // We apply retry mainly to establish the stream connection
-            stream = await ollamaServer.retryWithTimeout(async () => {
+            const stream = await ollamaServer.retryWithTimeout(async () => {
                 return await ollama.chat({
                     model: model,
                     messages: processedMessages,
                     stream: true,
-                    // --- Use configured keepAliveDuration ---
                     keep_alive: ollamaServer.config.keepAliveDuration,
                     options: {
                         ...(options.llmOptions || {})
                     }
                 });
-            }, model); // Pass modelName for logging in retry
+            }, model);
 
-            // Process the stream
             for await (const chunk of stream) {
                 if (chunk?.message?.content) {
                     const token = ollamaServer.cleanThinkSection(chunk.message.content);
-                    if (token) { // Only send non-empty tokens
-                        onToken(token);
-                    }
+                    if (token) onToken(token);
                 }
-                // Handle potential errors within the stream if the library provides them
                 if (chunk?.error) {
-                    console.error(`[${model}] Error received in stream chunk:`, chunk.error);
-                    // Depending on desired behavior, you might want to throw or just log
+                    console.error(`[${model}] Error in stream:`, chunk.error);
                     throw new Error(`Stream error for ${model}: ${chunk.error}`);
                 }
             }
             console.log(`[${model}] Stream finished.`);
-
         } catch (error) {
-            console.error(`Error during streamWithOllama for ${model}:`, error);
-            // Ensure error is propagated or handled appropriately for the stream consumer
-            throw error; // Re-throw the error to be caught by the calling endpoint
+            console.error(`Error streaming with ${model}:`, error);
+            throw error;
         }
-    }, model); // Pass model name to enqueue
+    }, model);
 }
-
 
 // ----- Express Server Setup -----
 const app = express();
 const port = process.env.PORT || 10086;
 
-// Middleware to parse JSON bodies.
+// Middleware
 app.use(express.json());
 
-// POST /chat endpoint
+// Chat endpoint
 app.post('/chat', async (req, res) => {
     try {
         const { messages, options } = req.body;
@@ -399,7 +557,7 @@ app.post('/chat', async (req, res) => {
     }
 });
 
-// POST /complete endpoint
+// Completion endpoint
 app.post('/complete', async (req, res) => {
     try {
         const { prompt, options } = req.body;
@@ -415,7 +573,7 @@ app.post('/complete', async (req, res) => {
     }
 });
 
-// GET /models endpoint
+// Models endpoint
 app.get('/models', async (req, res) => {
     try {
         console.log('Received /models request');
@@ -427,81 +585,124 @@ app.get('/models', async (req, res) => {
     }
 });
 
-// POST /chat-stream endpoint
+// Streaming chat endpoint
 app.post('/chat-stream', async (req, res) => {
     try {
         const { messages, options } = req.body;
         if (!Array.isArray(messages) || messages.length === 0) {
-            // Don't set SSE headers if input is invalid
             return res.status(400).json({ error: '`messages` must be a non-empty array.' });
         }
         console.log(`Received /chat-stream request for model: ${options?.model || 'default'}`);
 
-        // Set headers for Server-Sent Events (SSE).
+        // Set SSE headers
         res.set({
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
             Connection: 'keep-alive',
-            'X-Accel-Buffering': 'no' // Often needed for proxy environments like Nginx
+            'X-Accel-Buffering': 'no'
         });
-        // Flush headers immediately.
         res.flushHeaders();
 
-        // Function to send data chunks
+        // Create token handler
         const sendToken = (token) => {
-            // Ensure data is properly formatted for SSE
-            const formattedToken = JSON.stringify(token); // Send tokens as JSON strings
+            const formattedToken = JSON.stringify(token);
             res.write(`data: ${formattedToken}\n\n`);
-            // Flush data frequently for real-time feel, maybe not needed on every token
             if (res.flush) res.flush();
         };
 
-        // Execute the streaming call
+        // Stream the response
         await streamWithOllama(messages, options, sendToken);
 
-        // Indicate stream completion cleanly
+        // Finish stream
         res.write('data: [DONE]\n\n');
         res.end();
-        console.log(`Finished /chat-stream request for model: ${options?.model || 'default'}`);
-
     } catch (error) {
         console.error('Error in /chat-stream endpoint:', error.message);
-        // If headers are already sent, we can't send a 500 status code.
-        // Send an error event instead.
         if (!res.headersSent) {
-            // If headers not sent, maybe we can still send JSON error (e.g., bad input before SSE setup)
-            // This case is less likely given the check at the start, but good practice.
             res.status(500).json({ error: error.message || 'An internal server error occurred during stream setup' });
         } else {
-            // Send error message via SSE stream if possible
             try {
                 const errorMessage = JSON.stringify({ error: error.message || 'An error occurred during streaming' });
                 res.write(`event: error\ndata: ${errorMessage}\n\n`);
-                res.end(); // Close the connection after sending the error
             } catch (writeError) {
-                console.error("Failed to write error to SSE stream:", writeError);
-                res.end(); // Ensure connection is closed anyway
+                console.error("Failed to write error to stream:", writeError);
+            } finally {
+                res.end();
             }
         }
     }
 });
 
+// System status endpoint with enhanced GPU metrics
+app.get('/system-status', async (req, res) => {
+    try {
+        // Get real-time GPU VRAM data
+        const vramData = await getNvidiaVRAMUsage();
 
-// Graceful Shutdown Handler (Optional but Recommended)
+        // Get currently loaded models from Ollama
+        const runningModels = await getLoadedModels();
+
+        // Get detailed model information from our tracking
+        const loadedModelInfo = Array.from(ollamaServer.loadedModels.entries()).map(([name, info]) => ({
+            name,
+            size: `${info.size.toFixed(2)} GB`,
+            lastUsed: new Date(info.lastUsed).toISOString(),
+            activeTasks: info.activeTaskCount,
+            expires: info.expires ? new Date(info.expires).toISOString() : null
+        }));
+
+        // Calculate VRAM information
+        const vramInfo = {
+            total: vramData.total,
+            used: vramData.used,
+            free: vramData.free,
+
+            // Our tracking (for comparison)
+            tracked: {
+                active: ollamaServer.currentActiveVRAMUsage,
+                available: AVAILABLE_VRAM,
+                reserved: RESERVED_VRAM
+            }
+        };
+
+        // Queue information
+        const queueInfo = {
+            length: ollamaServer.taskQueue.length,
+            models: ollamaServer.taskQueue.map(task => task.modelName)
+        };
+
+        res.json({
+            vram: vramInfo,
+            models: loadedModelInfo,
+            ollamaModels: runningModels,
+            queue: queueInfo
+        });
+    } catch (error) {
+        console.error('Error in /system-status endpoint:', error);
+        res.status(500).json({ error: 'Failed to get system status' });
+    }
+});
+
+// Graceful shutdown handler
 const signals = {
     'SIGHUP': 1,
     'SIGINT': 2,
     'SIGTERM': 15
 };
 
-let serverInstance; // To hold the server instance for closing
+let serverInstance;
 
 const shutdown = (signal, value) => {
     console.log(`Received ${signal}. Shutting down gracefully...`);
+
+    // Clear VRAM monitoring interval
+    if (ollamaServer.vramMonitorInterval) {
+        clearInterval(ollamaServer.vramMonitorInterval);
+    }
+
     if (serverInstance) {
         serverInstance.close(() => {
-            console.log('Http server closed.');
-            // Add any other cleanup logic here (e.g., close DB connections)
+            console.log('HTTP server closed.');
             process.exit(128 + value);
         });
     } else {
@@ -515,11 +716,20 @@ Object.keys(signals).forEach((signal) => {
     });
 });
 
+// Debug endpoint to inspect Ollama PS output
+app.get('/debug/ollama-ps', async (req, res) => {
+    try {
+        const response = await ollama.ps();
+        res.json(response);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
-// Start the Express server.
+// Start server
 serverInstance = app.listen(port, () => {
-    console.log(`Express server running on port ${port}`);
-    console.log(`Available VRAM for tasks: ${AVAILABLE_VRAM.toFixed(2)} GB`);
+    console.log(`Enhanced Ollama server running on port ${port}`);
     console.log(`Default model: ${ollamaServer.config.defaultModel}`);
     console.log(`Model keep-alive duration: ${ollamaServer.config.keepAliveDuration}`);
+    console.log(`VRAM monitoring enabled (${ollamaServer.config.vramMonitorIntervalMs/1000}s interval)`);
 });
